@@ -1,0 +1,114 @@
+name: Build signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch or tag
+        required: true
+        default: main
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: music-app-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone private source
+        env:
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REF: ${{ github.event.inputs.source_ref || 'main' }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SOURCE_DEPLOY_KEY" | base64 --decode > ~/.ssh/music-app-source
+          chmod 600 ~/.ssh/music-app-source
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/music-app-source -o IdentitiesOnly=yes' \
+            git clone --depth 1 --branch "$SOURCE_REF" git@github.com:20ns/music-app.git source
+
+      - name: Resolve release metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git -C source rev-parse HEAD)
+          tag="build-$sha"
+          if gh release view "$tag" --repo 20ns/music-app-releases >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version_code=$(($(date -u +%s) / 60))" >> "$GITHUB_OUTPUT"
+          echo "version_name=0.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "notes=$(git -C source log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        if: steps.metadata.outputs.exists != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        if: steps.metadata.outputs.exists != 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Restore signing key
+        if: steps.metadata.outputs.exists != 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/music-app-release.jks"
+
+      - name: Test and build
+        if: steps.metadata.outputs.exists != 'true'
+        working-directory: source
+        env:
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+          VERSION_NAME: ${{ steps.metadata.outputs.version_name }}
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/music-app-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew testDebugUnitTest lintDebug assembleRelease
+
+      - name: Publish release
+        if: steps.metadata.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+          VERSION_NAME: ${{ steps.metadata.outputs.version_name }}
+          NOTES: ${{ steps.metadata.outputs.notes }}
+        run: |
+          cp source/app/build/outputs/apk/release/app-release.apk music-app.apk
+          sha256=$(sha256sum music-app.apk | cut -d' ' -f1)
+          apk_url="https://github.com/20ns/music-app-releases/releases/download/$TAG/music-app.apk"
+          jq -n \
+            --argjson versionCode "$VERSION_CODE" \
+            --arg versionName "$VERSION_NAME" \
+            --arg apkUrl "$apk_url" \
+            --arg sha256 "$sha256" \
+            --arg notes "$NOTES" \
+            --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{versionCode: $versionCode, versionName: $versionName, apkUrl: $apkUrl, sha256: $sha256, notes: $notes, publishedAt: $publishedAt}' \
+            > update.json
+          gh release create "$TAG" music-app.apk update.json \
+            --repo 20ns/music-app-releases \
+            --title "Music App $VERSION_NAME" \
+            --notes "$NOTES" \
+            --latest
+
+      - name: Remove temporary keys
+        if: always()
+        run: rm -f ~/.ssh/music-app-source "$RUNNER_TEMP/music-app-release.jks"
